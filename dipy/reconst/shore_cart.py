@@ -79,11 +79,11 @@ class ShoreCartFit():
 
         Eq.32
         """
-        I_s = self.model.cache_get('shore_odf_matrix', key=sphere)
+        I_s = self.model.cache_get('shore_odf_matrix', key=(sphere, smoment))
         if I_s is None:
             I_s = shore_odf_matrix(self.radial_order,
                                    self.mu, smoment, sphere.vertices)
-            self.model.cache_set('shore_odf_matrix', sphere, I_s)
+            self.model.cache_set('shore_odf_matrix', (sphere, smoment), I_s)
 
         odf = np.dot(I_s, self._shore_coef)
         return odf
