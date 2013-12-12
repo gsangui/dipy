@@ -3,11 +3,12 @@ from dipy.reconst.cache import Cache
 from dipy.reconst.multi_voxel import multi_voxel_fit
 from scipy.special import hermite, gamma
 from scipy.misc import factorial, factorial2
+from cvxopt import matrix, solvers
 
 
 class ShoreCartModel(Cache):
 
-    def __init__(self, gtab, radial_order=6, mu=1, lambd=0):
+    def __init__(self, gtab, radial_order=6, mu=1, lambd=0, e0_cons = True, eap_cons = True):
 
         self.bvals = gtab.bvals
         self.bvecs = gtab.bvecs
@@ -15,39 +16,76 @@ class ShoreCartModel(Cache):
         self.radial_order = radial_order
         self.mu = mu
         self.lambd = lambd
+        self.e0_cons = e0_cons
+        self.eap_cons = eap_cons
 
         if (gtab.big_delta is None) or (gtab.small_delta is None):
             self.tau = 1 / (4 * np.pi ** 2)
         else:
             self.tau = gtab.big_delta - gtab.small_delta / 3.0
 
+
     @multi_voxel_fit
     def fit(self, data):
-
         # Generate the SHORE basis
-        M = self.cache_get('shore_phi_matrix', key=self.gtab)
+        # Temporary variable to turn constraints off for testing purposes
+        M = self.cache_get('shore_phi_matrix', key=(self.radial_order, self.mu, self.gtab, self.tau))
         if M is None:
             M = shore_phi_matrix(
                 self.radial_order,  self.mu, self.gtab, self.tau)
-            self.cache_set('shore_phi_matrix', self.gtab, M)
+            self.cache_set('shore_phi_matrix', (self.radial_order, self.mu, self.gtab, self.tau), M)
 
-        ind_mat = self.cache_get('shore_index_matrix', key=self.gtab)
+        ind_mat = self.cache_get('shore_index_matrix', key=self.radial_order)
         if ind_mat is None:
             ind_mat = shore_index_matrix(self.radial_order)
-            self.cache_set('shore_index_matrix', self.gtab, ind_mat)
+            self.cache_set('shore_index_matrix', self.radial_order, ind_mat)
 
-        LR = self.cache_get('shore_laplace_matrix', key=self.gtab)
+        LR = self.cache_get('shore_laplace_matrix', key=(self.radial_order, self.mu))
         if LR is None:
             LR = shore_laplace_reg_matrix(self.radial_order, self.mu)
-            self.cache_set('shore_laplace_matrix', self.gtab, LR)
+            self.cache_set('shore_laplace_matrix', (self.radial_order, self.mu), LR)
+
+        if self.eap_cons:
+            K = self.cache_get('shore_psi_matrix_nonneg', key=(self.radial_order, self.mu, self.tau))
+            if K is None:
+                # rmax is linear in mu with rmax \aprox 0.3 for mu = 1/(2*pi*sqrt(700))
+                rmax = 0.35 * self.mu * (2 * np.pi * np.sqrt(700))
+                rgrad = gen_rgrid(rmax = rmax, Nstep = 10)
+                K = shore_psi_matrix(
+                    self.radial_order,  self.mu, rgrad, self.tau)
+                self.cache_set('shore_psi_matrix_nonneg', (self.radial_order, self.mu, self.tau), K)
 
 
-        pseudo_inv = np.dot(np.linalg.inv(np.dot(M.T, M) + self.lambd * LR),
-                            M.T)
+        Q = self.cache_get('Q_matrix', key=(self.radial_order, self.mu, self.gtab, self.tau, self.lambd))
+        if Q is None:
+            # Because M and LR are already updated a few line above
+            Q = matrix(np.dot(M.T,M) + self.lambd * LR)
+            self.cache_set('Q_matrix', (self.radial_order, self.mu, self.gtab, self.tau, self.lambd), Q)
 
-        coef = np.dot(pseudo_inv, data)
+
+        p = matrix(-1*np.dot(M.T,data))
+        
+        if self.eap_cons:
+            G = matrix(-1*K)
+            h = matrix(np.zeros((K.shape[0])),(K.shape[0],1))
+        else:
+            G = None
+            h = None
+
+        if self.e0_cons:
+            #line of M corresponding to q=0
+            A = matrix(M[0],(1,M.shape[1]))
+            b = matrix(1.0)
+        else:
+            A = None
+            b = None
+
+        solvers.options['show_progress'] = False
+        sol = solvers.qp(Q, p, G, h, A, b)
+
+        coef = np.array(sol['x'])[:,0]
+
         return ShoreCartFit(self, coef)
-
 
 class ShoreCartFit():
 
@@ -86,6 +124,7 @@ class ShoreCartFit():
             self.model.cache_set('shore_odf_matrix', (sphere, smoment), I_s)
 
         odf = np.dot(I_s, self._shore_coef)
+        print(odf.shape)
         return odf
 
 
@@ -171,8 +210,6 @@ def shore_phi_matrix(radial_order, mu, gtab, tau):
 
     qgradients = qvals[:, None] * bvecs
 
-    np.savetxt('qgradients.txt', qgradients)
-
     n_elem = ind_mat.shape[0]
 
     n_qgrad = qgradients.shape[0]
@@ -184,6 +221,22 @@ def shore_phi_matrix(radial_order, mu, gtab, tau):
             M[i, j] = shore_phi_3d(ind_mat[j], qgradients[i], mu)
 
     return M
+
+def shore_psi_matrix(radial_order, mu, rgrad, tau):
+
+    ind_mat = shore_index_matrix(radial_order)
+
+    n_elem = ind_mat.shape[0]
+
+    n_rgrad = rgrad.shape[0]
+
+    K = np.zeros((n_rgrad, n_elem))
+
+    for i in range(n_rgrad):
+        for j in range(n_elem):
+            K[i, j] = shore_psi_3d(ind_mat[j], rgrad[i], mu)
+
+    return K
 
 
 def shore_odf_matrix(radial_order, mu, smoment, vertices):
@@ -342,6 +395,18 @@ def shore_laplace_reg_matrix(radial_order, mu):
     return LR
 
 
+def gen_rgrid(rmax, Nstep = 10):
+    rgrad = []
+    # Build a regular grid of Nstep**3 points in (R^2 X R+)
+    gridmax = rmax / np.sqrt(3)
+    for xx in np.linspace(-gridmax,gridmax,Nstep):
+        for yy in np.linspace(-gridmax,gridmax,Nstep):
+            for zz in np.linspace(0,gridmax,Nstep):
+                rgrad.append([xx, yy, zz])
+    return np.array(rgrad)
+
+
+
 def shore_e0(radial_order, coeff):
 
     ind_mat = shore_index_matrix(radial_order)
@@ -378,6 +443,22 @@ def shore_evaluate_E(radial_order, coeff, qlist, mu):
     for i in range(n_qgrad):
         for j in range(n_elem):
             data_out[i] += coeff[j] * shore_phi_3d(ind_mat[j], qlist[i], mu)
+
+    return data_out
+
+def shore_evaluate_EAP(radial_order, coeff, rlist, mu):
+
+    ind_mat = shore_index_matrix(radial_order)
+    
+    n_elem = ind_mat.shape[0]
+
+    n_rgrad = rlist.shape[0]
+
+    data_out = np.zeros(n_rgrad)
+
+    for i in range(n_rgrad):
+        for j in range(n_elem):
+            data_out[i] += coeff[j] * shore_psi_3d(ind_mat[j], rlist[i], mu)
 
     return data_out
 
